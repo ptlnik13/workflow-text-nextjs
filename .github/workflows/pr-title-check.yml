@@ -1,0 +1,22 @@
+name: PR Title Check
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  validate-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title format
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "PR title: $PR_TITLE"
+          if [[ ! "$PR_TITLE" =~ ^\[[A-Za-z]+-[0-9]+\]:\ [A-Za-z].*$ ]]; then
+            echo "::error::Invalid PR title format."
+            echo "Expected format: [MSI-123]: Some Text Here"
+            echo "Rules: '[', alphabets, '-', number, ']', ':', space, then text starting with an alphabet."
+            exit 1
+          fi
+          echo "PR title is valid."
