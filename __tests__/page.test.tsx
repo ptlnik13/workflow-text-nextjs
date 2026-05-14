@@ -11,7 +11,7 @@ describe("Home page", () => {
         level: 1,
         name: /to get started, edit the page\.tsx file\./i,
       }),
-    ).toBeInTheDocument();
+    ).not.toBeInTheDocument();
   });
 });
 
