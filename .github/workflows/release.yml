@@ -63,8 +63,9 @@ jobs:
           git add package.json
           [ -f package-lock.json ] && git add package-lock.json || true
           git commit -m "chore(release): ${{ steps.version.outputs.version }} [skip ci]"
-          # Delete local tag if it exists to avoid conflicts
+          # Delete local and remote tag if they exist to avoid conflicts
           git tag -d ${{ steps.version.outputs.version }} 2>/dev/null || true
+          git push origin :refs/tags/${{ steps.version.outputs.version }} 2>/dev/null || true
           git tag ${{ steps.version.outputs.version }}
           git push origin main --follow-tags
 
