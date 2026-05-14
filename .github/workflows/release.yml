@@ -67,9 +67,6 @@ jobs:
         run: |
           TAG="${{ steps.version.outputs.version }}"
 
-          # Rebase on latest main to avoid non-fast-forward push failures.
-          git pull --rebase origin main
-
           git add package.json
           [ -f package-lock.json ] && git add package-lock.json || true
 
@@ -77,6 +74,10 @@ jobs:
             echo "No release changes detected to commit."
           else
             git commit -m "chore(release): $TAG [skip ci]"
+            
+            # Rebase on latest main to avoid non-fast-forward push failures.
+            git pull --rebase origin main
+            
             git push origin HEAD:main
           fi
 
