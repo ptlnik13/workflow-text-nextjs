@@ -1,0 +1,75 @@
+name: Release on Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Determine bump type from labels
+        id: bump
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          echo "Labels: $LABELS"
+          if echo "$LABELS" | grep -qi '"same version"'; then
+            echo "Label 'same version' present — skipping release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -qi '"major"'; then
+            echo "type=major" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -qi '"minor"'; then
+            echo "type=minor" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -qiE '"(patch|bug)"'; then
+            echo "type=patch" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::PR must have one of these labels: major, minor, patch, bug, same version"
+            exit 1
+          fi
+
+      - name: Configure git
+        if: steps.bump.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        id: version
+        if: steps.bump.outputs.skip != 'true'
+        run: |
+          NEW_VERSION=$(npm version ${{ steps.bump.outputs.type }} --no-git-tag-version)
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "New version: $NEW_VERSION"
+
+      - name: Commit, tag, and push
+        if: steps.bump.outputs.skip != 'true'
+        run: |
+          git add package.json
+          [ -f package-lock.json ] && git add package-lock.json || true
+          git commit -m "chore(release): ${{ steps.version.outputs.version }} [skip ci]"
+          git tag ${{ steps.version.outputs.version }}
+          git push origin main --follow-tags
+
+      - name: Create GitHub Release
+        if: steps.bump.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ steps.version.outputs.version }} \
+            --generate-notes \
+            --title "${{ steps.version.outputs.version }}"
