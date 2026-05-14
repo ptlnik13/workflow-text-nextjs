@@ -62,3 +62,35 @@ jobs:
             ${{ runner.os }}-nextjs-${{ hashFiles('**/package-lock.json') }}-
       - run: npm ci
       - run: npm run build
+
+  validate-tags:
+    runs-on: ubuntu-latest
+    name: Validate Git Tags
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Check if all local tags are pushed to remote
+        run: |
+          git fetch origin --tags
+          local_tags=$(git tag --list)
+          remote_tags=$(git ls-remote --tags origin | awk '{print $2}' | sed 's|refs/tags/||g' | sed 's|\^{}$||g' | sort -u)
+          
+          unpushed=""
+          for tag in $local_tags; do
+            if ! echo "$remote_tags" | grep -q "^$tag$"; then
+              unpushed="$unpushed $tag"
+            fi
+          done
+          
+          if [ -n "$unpushed" ]; then
+            echo "❌ The following tags exist locally but are NOT pushed to remote:"
+            echo "$unpushed" | xargs
+            echo ""
+            echo "Run: git push origin$unpushed"
+            exit 1
+          else
+            echo "✅ All local tags are synced with remote"
+          fi
+
