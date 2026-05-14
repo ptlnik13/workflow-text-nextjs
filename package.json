@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "test": "jest",
+    "test:e2e": "playwright test",
     "start": "next start",
     "lint": "eslint"
   },
