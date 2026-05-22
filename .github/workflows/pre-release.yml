@@ -95,11 +95,11 @@ jobs:
 
       - name: Package artifact
         run: |
-          tar -czf prerelease-artifact.tar.gz \
+          tar -czf /tmp/prerelease-artifact.tar.gz \
             --exclude=./.git \
             --exclude=./node_modules \
-            --exclude=./prerelease-artifact.tar.gz \
             .
+          mv /tmp/prerelease-artifact.tar.gz prerelease-artifact.tar.gz
 
       # softprops/action-gh-release@v2 behaviour:
       #   is_new=true  → tag does not exist → creates tag at target_commitish + new release
