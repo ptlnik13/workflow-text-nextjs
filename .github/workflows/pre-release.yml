@@ -1,0 +1,162 @@
+name: Pre-release on PR label (hardened)
+
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# One active run per PR at a time. Any in-progress run for the same PR
+# is cancelled when a newer commit arrives, so the latest commit always wins.
+concurrency:
+  group: prerelease-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  prerelease:
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'pre-release')
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Source of truth: always the PR-branch package.json, never the base branch.
+      - name: Read base version from package.json
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "base_version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Tag is deterministic: v{branch-version}-pre-release-pr{PR_NUMBER}
+      #
+      # Benefits vs. the old counter approach:
+      #   - O(1) direct lookup — no paginated release search needed (fix #2)
+      #   - A version bump on the branch automatically produces a new tag (fix #3)
+      #   - No MAX-counter read → no race condition between concurrent jobs (fix #4)
+      #   - On synchronize: tag is force-moved to the new HEAD SHA so the git ref
+      #     always equals the artifact being published (fix #1)
+      - name: Resolve and anchor release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_VERSION: ${{ steps.version.outputs.base_version }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          TAG="v${BASE_VERSION}-pre-release-pr${PR_NUMBER}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          # Direct lookup — works regardless of how many releases exist in the repo.
+          RELEASE_ID=$(gh api "repos/${REPO}/releases/tags/${TAG}" \
+            --jq '.id' 2>/dev/null || true)
+
+          if [ -n "${RELEASE_ID}" ]; then
+            echo "is_new=false" >> "$GITHUB_OUTPUT"
+
+            # Fix #1 — Force-move the existing git tag to the new commit SHA so
+            # that the tag, the release body, and the uploaded artifact all refer
+            # to the same commit.  This is the GitHub Refs PATCH endpoint; setting
+            # force=true is equivalent to `git push --force-with-lease` on the ref.
+            gh api --method PATCH "repos/${REPO}/git/refs/tags/${TAG}" \
+              -f sha="${HEAD_SHA}" \
+              -F force=true
+          else
+            echo "is_new=true" >> "$GITHUB_OUTPUT"
+            # Tag does not exist yet — softprops will create it at target_commitish.
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build --if-present
+
+      - name: Package artifact
+        run: |
+          tar -czf prerelease-artifact.tar.gz . \
+            --exclude=.git \
+            --exclude=node_modules
+
+      # softprops/action-gh-release@v2 behaviour:
+      #   is_new=true  → tag does not exist → creates tag at target_commitish + new release
+      #   is_new=false → tag already exists (and was just force-moved above) → updates release
+      # In the rare race where two jobs pass concurrency simultaneously, both will
+      # converge: the second job finds the tag that the first just created and updates
+      # the release instead of failing.
+      - name: Create or update pre-release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.event.pull_request.head.sha }}
+          name: Pre-release ${{ steps.tag.outputs.tag }}
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          body: |
+            Automated pre-release for PR #${{ github.event.pull_request.number }}
+            Source branch: `${{ github.event.pull_request.head.ref }}`
+            Commit: `${{ github.event.pull_request.head.sha }}`
+          files: |
+            prerelease-artifact.tar.gz
+
+      # Replace this step with your real deploy command and emit the live URL.
+      - name: Set preview URL placeholder
+        id: preview
+        run: |
+          echo "url=" >> "$GITHUB_OUTPUT"
+
+      - name: Upsert PR comment with release details
+        uses: actions/github-script@v7
+        env:
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+          MARKER: "<!-- prerelease-comment -->"
+        with:
+          script: |
+            const marker   = process.env.MARKER;
+            const releaseUrl = process.env.RELEASE_URL;
+            const tag       = process.env.TAG;
+            const previewUrl = process.env.PREVIEW_URL;
+
+            let body = `${marker}
+            ✅ Pre-release ready: **${tag}**
+            🔗 Release: ${releaseUrl}`;
+
+            if (previewUrl && previewUrl.trim().length > 0) {
+              body += `\n🌐 Preview: ${previewUrl}`;
+            }
+
+            const { owner, repo } = context.repo;
+            const issue_number    = context.issue.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body
+              });
+            }
+
