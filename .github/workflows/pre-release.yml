@@ -66,13 +66,22 @@ jobs:
           if [ -n "${RELEASE_ID}" ]; then
             echo "is_new=false" >> "$GITHUB_OUTPUT"
 
-            # Fix #1 — Force-move the existing git tag to the new commit SHA so
-            # that the tag, the release body, and the uploaded artifact all refer
-            # to the same commit.  This is the GitHub Refs PATCH endpoint; setting
-            # force=true is equivalent to `git push --force-with-lease` on the ref.
-            gh api --method PATCH "repos/${REPO}/git/refs/tags/${TAG}" \
-              -f sha="${HEAD_SHA}" \
-              -F force=true
+            # Fix #1 — Anchor the git tag to the new HEAD SHA so that the tag,
+            # the release body, and the uploaded artifact all refer to the same commit.
+            #
+            # Two-step upsert for the git ref:
+            #   PATCH  → moves an existing ref   (HTTP 200)
+            #   POST   → creates a missing ref    (used as fallback when PATCH returns 422
+            #             "Reference does not exist" — this happens when the GitHub Release
+            #             record exists but the backing git tag ref was never written or was
+            #             deleted independently)
+            if ! gh api --method PATCH "repos/${REPO}/git/refs/tags/${TAG}" \
+                   -f sha="${HEAD_SHA}" \
+                   -F force=true 2>/dev/null; then
+              gh api --method POST "repos/${REPO}/git/refs" \
+                -f ref="refs/tags/${TAG}" \
+                -f sha="${HEAD_SHA}"
+            fi
           else
             echo "is_new=true" >> "$GITHUB_OUTPUT"
             # Tag does not exist yet — softprops will create it at target_commitish.
