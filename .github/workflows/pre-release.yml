@@ -8,8 +8,8 @@ permissions:
   contents: write
   pull-requests: write
 
-# One active run per PR at a time. Any in-progress run for the same PR
-# is cancelled when a newer commit arrives, so the latest commit always wins.
+# Only one release job runs per PR at a time.
+# If someone manages to double-click the label, the first run wins.
 concurrency:
   group: prerelease-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -37,55 +37,36 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           echo "base_version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      # Tag is deterministic: v{branch-version}-pre-release-pr{PR_NUMBER}
-      #
-      # Benefits vs. the old counter approach:
-      #   - O(1) direct lookup — no paginated release search needed (fix #2)
-      #   - A version bump on the branch automatically produces a new tag (fix #3)
-      #   - No MAX-counter read → no race condition between concurrent jobs (fix #4)
-      #   - On synchronize: tag is force-moved to the new HEAD SHA so the git ref
-      #     always equals the artifact being published (fix #1)
-      - name: Resolve and anchor release tag
+      # Every label-add = a brand-new release with the next counter.
+      # Format: v{branch-version}-pre-release-0.{N}
+      # e.g.  v5.2.0-pre-release-0.1  →  v5.2.0-pre-release-0.2  →  …
+      # Counter is scoped to the version so a version bump resets numbering naturally.
+      - name: Resolve next release tag
         id: tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_VERSION: ${{ steps.version.outputs.base_version }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
-          TAG="v${BASE_VERSION}-pre-release-pr${PR_NUMBER}"
+          PREFIX="v${BASE_VERSION}-pre-release-0."
+
+          # Fetch all tags (paginated — no cap).
+          # API call is kept separate from grep so only "no matches" is suppressed,
+          # not a real API/network failure.
+          ALL_TAGS=$(gh api "repos/${REPO}/tags" --paginate --jq '.[].name')
+
+          MAX=$(echo "${ALL_TAGS}" \
+            | grep -E "^${PREFIX}[0-9]+$" \
+            | sed -E "s/^${PREFIX}//" \
+            | sort -n | tail -1 || true)
+
+          NEXT=$(( ${MAX:-0} + 1 ))
+          TAG="${PREFIX}${NEXT}"
+
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-          # Direct lookup — works regardless of how many releases exist in the repo.
-          RELEASE_ID=$(gh api "repos/${REPO}/releases/tags/${TAG}" \
-            --jq '.id' 2>/dev/null || true)
-
-          if [ -n "${RELEASE_ID}" ]; then
-            echo "is_new=false" >> "$GITHUB_OUTPUT"
-
-            # Fix #1 — Anchor the git tag to the new HEAD SHA so that the tag,
-            # the release body, and the uploaded artifact all refer to the same commit.
-            #
-            # Two-step upsert for the git ref:
-            #   PATCH  → moves an existing ref   (HTTP 200)
-            #   POST   → creates a missing ref    (used as fallback when PATCH returns 422
-            #             "Reference does not exist" — this happens when the GitHub Release
-            #             record exists but the backing git tag ref was never written or was
-            #             deleted independently)
-            if ! gh api --method PATCH "repos/${REPO}/git/refs/tags/${TAG}" \
-                   -f sha="${HEAD_SHA}" \
-                   -F force=true 2>/dev/null; then
-              gh api --method POST "repos/${REPO}/git/refs" \
-                -f ref="refs/tags/${TAG}" \
-                -f sha="${HEAD_SHA}"
-            fi
-          else
-            echo "is_new=true" >> "$GITHUB_OUTPUT"
-            # Tag does not exist yet — softprops will create it at target_commitish.
-          fi
 
       - name: Install dependencies
         run: npm ci
@@ -101,19 +82,14 @@ jobs:
             .
           mv /tmp/prerelease-artifact.tar.gz prerelease-artifact.tar.gz
 
-      # softprops/action-gh-release@v2 behaviour:
-      #   is_new=true  → tag does not exist → creates tag at target_commitish + new release
-      #   is_new=false → tag already exists (and was just force-moved above) → updates release
-      # In the rare race where two jobs pass concurrency simultaneously, both will
-      # converge: the second job finds the tag that the first just created and updates
-      # the release instead of failing.
-      - name: Create or update pre-release
+      # Every run creates a fresh release — never updates an existing one.
+      - name: Create pre-release
         id: release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ github.event.pull_request.head.sha }}
-          name: Pre-release ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
           prerelease: true
           make_latest: false
           generate_release_notes: true
