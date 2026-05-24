@@ -2,7 +2,7 @@ name: Pre-release on PR label (hardened)
 
 on:
   pull_request:
-    types: [labeled, synchronize, reopened]
+    types: [labeled]
 
 permissions:
   contents: write
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   prerelease:
     runs-on: ubuntu-latest
-    if: contains(github.event.pull_request.labels.*.name, 'pre-release')
+    if: github.event.label.name == 'pre-release'
 
     steps:
       - name: Checkout PR head
