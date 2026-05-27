@@ -99,88 +99,53 @@ jobs:
           files: |
             prerelease-artifact.tar.gz
 
-      # Each pre-release tag gets its own dedicated Contentstack Launch environment
-      # so every release has a permanently isolated URL that is never overwritten.
+      # Each pre-release tag gets its own isolated Contentstack Launch environment.
       #
-      # Environment name = tag with dots replaced by dashes, e.g.:
-      #   v5.2.0-pre-release-0.9  →  v5-2-0-pre-release-0-9
+      # Because the Launch API does not expose an endpoint for creating environments
+      # programmatically, environments must be pre-created in the Launch dashboard.
+      # Store their UIDs as a comma-separated secret, e.g.:
+      #
+      #   CS_PREVIEW_ENVIRONMENT_UIDS = uid1,uid2,uid3,uid4,uid5
+      #
+      # The workflow picks a slot using:  counter mod len(uids)
+      # So release-0.1 → slot 0, release-0.2 → slot 1, …, release-0.6 → slot 0 again.
+      # In practice a slot is only reused after (uids.length) releases, by which time
+      # the earlier release is irrelevant.
       #
       # Required secrets:
-      #   CS_AUTH_TOKEN      — user authtoken (BASIC auth)
-      #   CS_ORG_UID         — organisation UID
-      #   CS_PROJECT_UID     — Launch project UID
-      #   CS_REGION          — e.g. NA, EU, AZURE_NA
-      #   CS_LAUNCH_API_BASE — e.g. https://launch-api.contentstack.com
-      - name: Provision per-release environment
+      #   CS_AUTH_TOKEN                — user authtoken (BASIC auth)
+      #   CS_ORG_UID                   — organisation UID
+      #   CS_PROJECT_UID               — Launch project UID
+      #   CS_REGION                    — e.g. NA, EU, AZURE_NA
+      #   CS_PREVIEW_ENVIRONMENT_UIDS  — comma-separated list of pre-created env UIDs
+      - name: Select preview environment slot
         id: env
         env:
-          CS_AUTH_TOKEN:      ${{ secrets.CS_AUTH_TOKEN }}
-          CS_ORG_UID:         ${{ secrets.CS_ORG_UID }}
-          CS_PROJECT_UID:     ${{ secrets.CS_PROJECT_UID }}
-          CS_LAUNCH_API_BASE: ${{ secrets.CS_LAUNCH_API_BASE }}
-          TAG:                ${{ steps.tag.outputs.tag }}
+          CS_PREVIEW_ENVIRONMENT_UIDS: ${{ secrets.CS_PREVIEW_ENVIRONMENT_UIDS }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
 
-          # Sanitise: dots → dashes  (v5.2.0-pre-release-0.9 → v5-2-0-pre-release-0-9)
-          ENV_NAME=$(echo "${TAG}" | tr '.' '-')
-          API="${CS_LAUNCH_API_BASE}/v1/projects/${CS_PROJECT_UID}/environments"
+          # Extract the release counter from the tag (the trailing number after the last dot)
+          COUNTER=$(echo "${TAG}" | grep -oE '[0-9]+$')
 
-          # Tags are unique by design — this environment should never exist yet.
-          # We check anyway to handle retries / re-runs gracefully.
-          # -s = silent, -w outputs HTTP status; -f is intentionally omitted so
-          # we always get the response body and can log it on failure.
-          GET_BODY=$(curl -s -w '\n%{http_code}' \
-            -H "authtoken: ${CS_AUTH_TOKEN}" \
-            -H "organization_uid: ${CS_ORG_UID}" \
-            "${API}?name=${ENV_NAME}")
-          GET_STATUS=$(echo "$GET_BODY" | tail -1)
-          GET_JSON=$(echo "$GET_BODY" | head -n -1)
+          # Split the comma-separated UID list into an array and pick by rotation
+          IFS=',' read -ra UIDS <<< "${CS_PREVIEW_ENVIRONMENT_UIDS}"
+          COUNT=${#UIDS[@]}
 
-          echo "GET ${API}?name=${ENV_NAME} → HTTP ${GET_STATUS}"
-          echo "$GET_JSON"
-
-          if [ "$GET_STATUS" -ge 200 ] && [ "$GET_STATUS" -lt 300 ]; then
-            EXISTING=$(echo "$GET_JSON" \
-              | jq -r '.data // [] | map(select(.name == "'"${ENV_NAME}"'")) | .[0].uid // ""')
-          else
-            echo "Warning: GET failed (${GET_STATUS}) — will attempt to create the environment anyway."
-            EXISTING=""
-          fi
-
-          if [ -n "$EXISTING" ]; then
-            echo "Reusing existing environment: ${ENV_NAME} (${EXISTING})"
-            echo "uid=${EXISTING}"   >> "$GITHUB_OUTPUT"
-            echo "name=${ENV_NAME}"  >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          POST_BODY=$(curl -s -w '\n%{http_code}' -X POST "${API}" \
-            -H "authtoken: ${CS_AUTH_TOKEN}" \
-            -H "organization_uid: ${CS_ORG_UID}" \
-            -H "Content-Type: application/json" \
-            -d '{"name":"'"${ENV_NAME}"'","frameworkPreset":"NextJs"}')
-          POST_STATUS=$(echo "$POST_BODY" | tail -1)
-          POST_JSON=$(echo "$POST_BODY" | head -n -1)
-
-          echo "POST ${API} → HTTP ${POST_STATUS}"
-          echo "$POST_JSON"
-
-          if [ "$POST_STATUS" -lt 200 ] || [ "$POST_STATUS" -ge 300 ]; then
-            echo "Error: environment creation returned HTTP ${POST_STATUS}."
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Error: CS_PREVIEW_ENVIRONMENT_UIDS secret is empty or not set."
             exit 1
           fi
 
-          NEW_UID=$(echo "$POST_JSON" | jq -r '.uid // .data.uid // ""')
+          SLOT=$(( COUNTER % COUNT ))
+          SELECTED_UID="${UIDS[$SLOT]}"
+          # Trim any accidental whitespace
+          SELECTED_UID="${SELECTED_UID// /}"
 
-          if [ -z "$NEW_UID" ]; then
-            echo "Error: could not parse environment UID from response above."
-            exit 1
-          fi
-
-          echo "Created environment: ${ENV_NAME} (${NEW_UID})"
-          echo "uid=${NEW_UID}"   >> "$GITHUB_OUTPUT"
-          echo "name=${ENV_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Release counter: ${COUNTER} | Slots available: ${COUNT} | Slot chosen: ${SLOT}"
+          echo "uid=${SELECTED_UID}"   >> "$GITHUB_OUTPUT"
+          echo "slot=${SLOT}"          >> "$GITHUB_OUTPUT"
 
       - name: Deploy to Contentstack Launch
         id: preview
@@ -249,7 +214,7 @@ jobs:
           RELEASE_URL: ${{ steps.release.outputs.url }}
           TAG:         ${{ steps.tag.outputs.tag }}
           PREVIEW_URL: ${{ steps.preview.outputs.url }}
-          ENV_NAME:    ${{ steps.env.outputs.name }}
+          ENV_SLOT:    ${{ steps.env.outputs.slot }}
           MARKER: "<!-- prerelease-comment -->"
         with:
           script: |
@@ -257,10 +222,10 @@ jobs:
             const releaseUrl = process.env.RELEASE_URL;
             const tag        = process.env.TAG;
             const previewUrl = process.env.PREVIEW_URL;
-            const envName    = process.env.ENV_NAME;
+            const envSlot    = process.env.ENV_SLOT;
 
             const previewCell = previewUrl && previewUrl.trim().length > 0
-              ? `[${envName} ↗](${previewUrl})`
+              ? `[slot-${envSlot} ↗](${previewUrl})`
               : `_(deploy failed)_`;
 
             const newRow = `| \`${tag}\` | [GitHub Release](${releaseUrl}) | ${previewCell} |`;
