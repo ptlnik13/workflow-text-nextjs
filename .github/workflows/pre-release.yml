@@ -145,13 +145,14 @@ jobs:
           JSON
 
           DEPLOY_OUTPUT=$(csdx launch \
-            --type        FileUpload \
-            --org         "$CS_ORG_UID" \
-            --environment "$CS_ENVIRONMENT_UID" \
-            --data-dir    . \
-            --framework   NextJs \
-            --build-command "npm run build" \
-            --out-dir     ".next" \
+            --type           FileUpload \
+            --org            "$CS_ORG_UID" \
+            --environment    "$CS_ENVIRONMENT_UID" \
+            --data-dir       . \
+            --framework      NextJs \
+            --build-command  "npm run build" \
+            --out-dir        ".next" \
+            --redeploy-latest \
             2>&1) || true
 
           echo "$DEPLOY_OUTPUT"
@@ -202,9 +203,6 @@ jobs:
                 owner, repo, issue_number, body
               });
             }
-
-
-
 
 
 
