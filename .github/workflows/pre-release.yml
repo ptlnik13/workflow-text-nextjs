@@ -146,10 +146,12 @@ jobs:
           JSON
 
           # Each pre-release gets its own immutable deployment URL.
-          # --redeploy-latest is intentionally omitted so every run creates a
-          # brand-new deployment instead of overwriting the shared environment slot.
+          # The CLI detects the existing project via .cs-launch.json and asks:
+          #   "Do you want to redeploy this existing Launch project? (Y/n)"
+          # Answering "n" makes it create a brand-new deployment with a fresh URL
+          # instead of overwriting the shared environment slot.
           # This prevents concurrent PRs from clobbering each other.
-          DEPLOY_OUTPUT=$(csdx launch \
+          DEPLOY_OUTPUT=$(printf 'n\n' | csdx launch \
             --type           FileUpload \
             --org            "$CS_ORG_UID" \
             --environment    "$CS_ENVIRONMENT_UID" \
