@@ -122,9 +122,20 @@ jobs:
         id: env
         env:
           CS_PREVIEW_ENVIRONMENT_UIDS: ${{ secrets.CS_PREVIEW_ENVIRONMENT_UIDS }}
+          CS_ENVIRONMENT_UID:          ${{ secrets.CS_ENVIRONMENT_UID }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
+
+          # If CS_PREVIEW_ENVIRONMENT_UIDS is not configured, fall back to the
+          # single default environment. All releases will share that URL until
+          # the pool secret is populated.
+          if [ -z "${CS_PREVIEW_ENVIRONMENT_UIDS:-}" ]; then
+            echo "CS_PREVIEW_ENVIRONMENT_UIDS not set — falling back to CS_ENVIRONMENT_UID."
+            echo "uid=${CS_ENVIRONMENT_UID}" >> "$GITHUB_OUTPUT"
+            echo "slot=default"              >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # Extract the release counter from the tag (the trailing number after the last dot)
           COUNTER=$(echo "${TAG}" | grep -oE '[0-9]+$')
@@ -133,19 +144,14 @@ jobs:
           IFS=',' read -ra UIDS <<< "${CS_PREVIEW_ENVIRONMENT_UIDS}"
           COUNT=${#UIDS[@]}
 
-          if [ "$COUNT" -eq 0 ]; then
-            echo "Error: CS_PREVIEW_ENVIRONMENT_UIDS secret is empty or not set."
-            exit 1
-          fi
-
           SLOT=$(( COUNTER % COUNT ))
           SELECTED_UID="${UIDS[$SLOT]}"
           # Trim any accidental whitespace
           SELECTED_UID="${SELECTED_UID// /}"
 
           echo "Release counter: ${COUNTER} | Slots available: ${COUNT} | Slot chosen: ${SLOT}"
-          echo "uid=${SELECTED_UID}"   >> "$GITHUB_OUTPUT"
-          echo "slot=${SLOT}"          >> "$GITHUB_OUTPUT"
+          echo "uid=${SELECTED_UID}" >> "$GITHUB_OUTPUT"
+          echo "slot=${SLOT}"        >> "$GITHUB_OUTPUT"
 
       - name: Deploy to Contentstack Launch
         id: preview
