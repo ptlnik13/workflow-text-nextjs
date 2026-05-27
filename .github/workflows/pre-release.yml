@@ -145,7 +145,6 @@ jobs:
           JSON
 
           DEPLOY_OUTPUT=$(csdx launch \
-            -c .cs-launch.json \
             --type        FileUpload \
             --org         "$CS_ORG_UID" \
             --environment "$CS_ENVIRONMENT_UID" \
@@ -203,6 +202,8 @@ jobs:
                 owner, repo, issue_number, body
               });
             }
+
+
 
 
 
