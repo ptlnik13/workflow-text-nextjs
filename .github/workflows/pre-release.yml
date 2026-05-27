@@ -128,11 +128,25 @@ jobs:
 
           # Tags are unique by design — this environment should never exist yet.
           # We check anyway to handle retries / re-runs gracefully.
-          EXISTING=$(curl -sf \
+          # -s = silent, -w outputs HTTP status; -f is intentionally omitted so
+          # we always get the response body and can log it on failure.
+          GET_BODY=$(curl -s -w '\n%{http_code}' \
             -H "authtoken: ${CS_AUTH_TOKEN}" \
             -H "organization_uid: ${CS_ORG_UID}" \
-            "${API}?name=${ENV_NAME}" \
-            | jq -r '.data // [] | map(select(.name == "'"${ENV_NAME}"'")) | .[0].uid // ""')
+            "${API}?name=${ENV_NAME}")
+          GET_STATUS=$(echo "$GET_BODY" | tail -1)
+          GET_JSON=$(echo "$GET_BODY" | head -n -1)
+
+          echo "GET ${API}?name=${ENV_NAME} → HTTP ${GET_STATUS}"
+          echo "$GET_JSON"
+
+          if [ "$GET_STATUS" -ge 200 ] && [ "$GET_STATUS" -lt 300 ]; then
+            EXISTING=$(echo "$GET_JSON" \
+              | jq -r '.data // [] | map(select(.name == "'"${ENV_NAME}"'")) | .[0].uid // ""')
+          else
+            echo "Warning: GET failed (${GET_STATUS}) — will attempt to create the environment anyway."
+            EXISTING=""
+          fi
 
           if [ -n "$EXISTING" ]; then
             echo "Reusing existing environment: ${ENV_NAME} (${EXISTING})"
@@ -141,17 +155,26 @@ jobs:
             exit 0
           fi
 
-          RESPONSE=$(curl -sf -X POST "${API}" \
+          POST_BODY=$(curl -s -w '\n%{http_code}' -X POST "${API}" \
             -H "authtoken: ${CS_AUTH_TOKEN}" \
             -H "organization_uid: ${CS_ORG_UID}" \
             -H "Content-Type: application/json" \
             -d '{"name":"'"${ENV_NAME}"'","frameworkPreset":"NextJs"}')
+          POST_STATUS=$(echo "$POST_BODY" | tail -1)
+          POST_JSON=$(echo "$POST_BODY" | head -n -1)
 
-          NEW_UID=$(echo "$RESPONSE" | jq -r '.uid // .data.uid // ""')
+          echo "POST ${API} → HTTP ${POST_STATUS}"
+          echo "$POST_JSON"
+
+          if [ "$POST_STATUS" -lt 200 ] || [ "$POST_STATUS" -ge 300 ]; then
+            echo "Error: environment creation returned HTTP ${POST_STATUS}."
+            exit 1
+          fi
+
+          NEW_UID=$(echo "$POST_JSON" | jq -r '.uid // .data.uid // ""')
 
           if [ -z "$NEW_UID" ]; then
-            echo "Error: could not create environment. API response:"
-            echo "$RESPONSE"
+            echo "Error: could not parse environment UID from response above."
             exit 1
           fi
 

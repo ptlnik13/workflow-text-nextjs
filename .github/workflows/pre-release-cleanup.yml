@@ -61,10 +61,16 @@ jobs:
           API="${CS_LAUNCH_API_BASE}/v1/projects/${CS_PROJECT_UID}/environments"
 
           for ENV_NAME in $ENV_NAMES; do
-            ENV_UID=$(curl -sf \
+            GET_BODY=$(curl -s -w '\n%{http_code}' \
               -H "authtoken: ${CS_AUTH_TOKEN}" \
               -H "organization_uid: ${CS_ORG_UID}" \
-              "${API}?name=${ENV_NAME}" \
+              "${API}?name=${ENV_NAME}")
+            GET_STATUS=$(echo "$GET_BODY" | tail -1)
+            GET_JSON=$(echo "$GET_BODY" | head -n -1)
+
+            echo "GET ${ENV_NAME} → HTTP ${GET_STATUS}"
+
+            ENV_UID=$(echo "$GET_JSON" \
               | jq -r '.data // [] | map(select(.name == "'"${ENV_NAME}"'")) | .[0].uid // ""')
 
             if [ -z "$ENV_UID" ]; then
@@ -73,10 +79,10 @@ jobs:
             fi
 
             echo "Deleting environment: ${ENV_NAME} (${ENV_UID})"
-            curl -sf -X DELETE "${API}/${ENV_UID}" \
+            DEL_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "${API}/${ENV_UID}" \
               -H "authtoken: ${CS_AUTH_TOKEN}" \
-              -H "organization_uid: ${CS_ORG_UID}"
-            echo "Deleted."
+              -H "organization_uid: ${CS_ORG_UID}")
+            echo "DELETE → HTTP ${DEL_STATUS}"
           done
 
       - name: Mark PR comment as cleaned up
