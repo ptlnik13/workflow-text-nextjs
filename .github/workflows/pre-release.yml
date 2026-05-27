@@ -139,7 +139,8 @@ jobs:
               "uid": "${CS_PROJECT_UID}",
               "organizationUid": "${CS_ORG_UID}",
               "projectType": "FILEUPLOAD",
-              "environment": "${CS_ENVIRONMENT_UID}"
+              "environment": "${CS_ENVIRONMENT_UID}",
+              "deployments": []
             }
           }
           JSON
@@ -203,6 +204,4 @@ jobs:
                 owner, repo, issue_number, body
               });
             }
-
-
 
