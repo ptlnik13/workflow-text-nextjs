@@ -145,13 +145,14 @@ jobs:
           }
           JSON
 
-          # Each pre-release gets its own immutable deployment URL.
-          # The CLI detects the existing project via .cs-launch.json and asks:
-          #   "Do you want to redeploy this existing Launch project? (Y/n)"
-          # Answering "n" makes it create a brand-new deployment with a fresh URL
-          # instead of overwriting the shared environment slot.
-          # This prevents concurrent PRs from clobbering each other.
-          DEPLOY_OUTPUT=$(printf 'n\n' | csdx launch \
+          # --redeploy-latest avoids the interactive "redeploy?" prompt.
+          # It DOES overwrite the shared environment URL
+          # (e.g. prerelease-artifact-test.contentstackapps.com) — that's fine,
+          # because Contentstack Launch also assigns every individual deployment its
+          # own immutable URL (e.g. https://deploy-<uid>.contentstackapps.com).
+          # We capture that per-deployment URL below and post it to the PR comment,
+          # so each pre-release is independently accessible forever.
+          DEPLOY_OUTPUT=$(csdx launch \
             --type           FileUpload \
             --org            "$CS_ORG_UID" \
             --environment    "$CS_ENVIRONMENT_UID" \
@@ -159,14 +160,27 @@ jobs:
             --framework      NextJs \
             --build-command  "npm run build" \
             --out-dir        ".next" \
+            --redeploy-latest \
             2>&1) || true
 
           echo "$DEPLOY_OUTPUT"
 
+          # The CLI prints two URL lines:
+          #   Environment URL  https://prerelease-artifact-test.contentstackapps.com  ← shared, changes each run
+          #   Deployment URL   https://deploy-<uid>.contentstackapps.com              ← unique, immutable per build
+          # We want the Deployment URL.
           PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" \
-            | grep -oE 'Deployment URL https://[^ ]+' \
-            | grep -oE 'https://[^ ]+' \
+            | grep -oiE '(deployment url)[[:space:]]+https://[^ ]+' \
+            | grep -oiE 'https://[^ ]+' \
             | tail -1 || true)
+
+          # Fallback: if the label differs, grab the second distinct https:// URL
+          if [ -z "$PREVIEW_URL" ]; then
+            PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" \
+              | grep -oE 'https://[^ ]+' \
+              | grep -v "contentstackapps.com$" \
+              | tail -1 || true)
+          fi
 
           echo "url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
 
