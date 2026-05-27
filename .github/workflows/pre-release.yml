@@ -134,7 +134,7 @@ jobs:
             --project-uid "$CS_PROJECT_UID" \
             --environment "$CS_ENVIRONMENT_UID" \
             --data-dir    . \
-            --framework   NextJS \
+            --framework   NextJs \
             --build-command "npm run build" \
             --out-dir     ".next" \
             --server-command "node_modules/.bin/next start" \
@@ -188,8 +188,5 @@ jobs:
                 owner, repo, issue_number, body
               });
             }
-
-
-
 
 
