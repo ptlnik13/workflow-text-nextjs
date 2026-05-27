@@ -1,0 +1,105 @@
+name: Cleanup pre-release environments on PR close
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      # Read the PR comment to discover every environment that was created for this PR.
+      # Each row in the table was deployed to an environment named after its tag
+      # (dots replaced by dashes), e.g. v5-2-0-pre-release-0-9
+      - name: Delete per-release Launch environments
+        uses: actions/github-script@v7
+        id: collect
+        env:
+          CS_AUTH_TOKEN:      ${{ secrets.CS_AUTH_TOKEN }}
+          CS_ORG_UID:         ${{ secrets.CS_ORG_UID }}
+          CS_PROJECT_UID:     ${{ secrets.CS_PROJECT_UID }}
+          CS_LAUNCH_API_BASE: ${{ secrets.CS_LAUNCH_API_BASE }}
+          MARKER: "<!-- prerelease-comment -->"
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number    = context.issue.number;
+            const marker          = process.env.MARKER;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (!existing) {
+              console.log("No pre-release comment found — nothing to clean up.");
+              core.setOutput("env_names", "");
+              return;
+            }
+
+            // Extract version tags from table rows, convert dots → dashes to get env names.
+            // Row format: | `v5.2.0-pre-release-0.9` | ...
+            const tags = [...existing.body.matchAll(/`(v[^`]+pre-release[^`]+)`/g)]
+              .map(m => m[1].replaceAll(".", "-"));
+
+            console.log("Environments to delete:", tags);
+            core.setOutput("env_names", tags.join(" "));
+
+      - name: Delete environments via Launch API
+        if: steps.collect.outputs.env_names != ''
+        env:
+          CS_AUTH_TOKEN:      ${{ secrets.CS_AUTH_TOKEN }}
+          CS_ORG_UID:         ${{ secrets.CS_ORG_UID }}
+          CS_PROJECT_UID:     ${{ secrets.CS_PROJECT_UID }}
+          CS_LAUNCH_API_BASE: ${{ secrets.CS_LAUNCH_API_BASE }}
+          ENV_NAMES:          ${{ steps.collect.outputs.env_names }}
+        run: |
+          set -euo pipefail
+          API="${CS_LAUNCH_API_BASE}/v1/projects/${CS_PROJECT_UID}/environments"
+
+          for ENV_NAME in $ENV_NAMES; do
+            ENV_UID=$(curl -sf \
+              -H "authtoken: ${CS_AUTH_TOKEN}" \
+              -H "organization_uid: ${CS_ORG_UID}" \
+              "${API}?name=${ENV_NAME}" \
+              | jq -r '.data // [] | map(select(.name == "'"${ENV_NAME}"'")) | .[0].uid // ""')
+
+            if [ -z "$ENV_UID" ]; then
+              echo "Environment '${ENV_NAME}' not found — skipping."
+              continue
+            fi
+
+            echo "Deleting environment: ${ENV_NAME} (${ENV_UID})"
+            curl -sf -X DELETE "${API}/${ENV_UID}" \
+              -H "authtoken: ${CS_AUTH_TOKEN}" \
+              -H "organization_uid: ${CS_ORG_UID}"
+            echo "Deleted."
+          done
+
+      - name: Mark PR comment as cleaned up
+        uses: actions/github-script@v7
+        env:
+          MARKER: "<!-- prerelease-comment -->"
+        with:
+          script: |
+            const marker = process.env.MARKER;
+            const { owner, repo } = context.repo;
+            const issue_number    = context.issue.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (!existing) return;
+
+            const updated = existing.body +
+              `\n\n> ⚠️ PR closed — all preview environments for this PR have been deleted.`;
+
+            await github.rest.issues.updateComment({
+              owner, repo, comment_id: existing.id, body: updated
+            });
+

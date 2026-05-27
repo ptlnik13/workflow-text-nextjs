@@ -67,7 +67,6 @@ jobs:
 
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-
       - name: Install dependencies
         run: npm ci
 
@@ -100,17 +99,74 @@ jobs:
           files: |
             prerelease-artifact.tar.gz
 
-      # Deploy to Contentstack Launch via FileUpload.
-      # Requires secret CS_AUTH_TOKEN (your user authtoken — run this locally to get it:
-      #   node -e "const {configHandler}=require('$(npm root -g)/@contentstack/cli/node_modules/@contentstack/cli-utilities'); console.log(configHandler.get('authtoken'))")
+      # Each pre-release tag gets its own dedicated Contentstack Launch environment
+      # so every release has a permanently isolated URL that is never overwritten.
+      #
+      # Environment name = tag with dots replaced by dashes, e.g.:
+      #   v5.2.0-pre-release-0.9  →  v5-2-0-pre-release-0-9
+      #
+      # Required secrets:
+      #   CS_AUTH_TOKEN      — user authtoken (BASIC auth)
+      #   CS_ORG_UID         — organisation UID
+      #   CS_PROJECT_UID     — Launch project UID
+      #   CS_REGION          — e.g. NA, EU, AZURE_NA
+      #   CS_LAUNCH_API_BASE — e.g. https://launch-api.contentstack.com
+      - name: Provision per-release environment
+        id: env
+        env:
+          CS_AUTH_TOKEN:      ${{ secrets.CS_AUTH_TOKEN }}
+          CS_ORG_UID:         ${{ secrets.CS_ORG_UID }}
+          CS_PROJECT_UID:     ${{ secrets.CS_PROJECT_UID }}
+          CS_LAUNCH_API_BASE: ${{ secrets.CS_LAUNCH_API_BASE }}
+          TAG:                ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # Sanitise: dots → dashes  (v5.2.0-pre-release-0.9 → v5-2-0-pre-release-0-9)
+          ENV_NAME=$(echo "${TAG}" | tr '.' '-')
+          API="${CS_LAUNCH_API_BASE}/v1/projects/${CS_PROJECT_UID}/environments"
+
+          # Tags are unique by design — this environment should never exist yet.
+          # We check anyway to handle retries / re-runs gracefully.
+          EXISTING=$(curl -sf \
+            -H "authtoken: ${CS_AUTH_TOKEN}" \
+            -H "organization_uid: ${CS_ORG_UID}" \
+            "${API}?name=${ENV_NAME}" \
+            | jq -r '.data // [] | map(select(.name == "'"${ENV_NAME}"'")) | .[0].uid // ""')
+
+          if [ -n "$EXISTING" ]; then
+            echo "Reusing existing environment: ${ENV_NAME} (${EXISTING})"
+            echo "uid=${EXISTING}"   >> "$GITHUB_OUTPUT"
+            echo "name=${ENV_NAME}"  >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RESPONSE=$(curl -sf -X POST "${API}" \
+            -H "authtoken: ${CS_AUTH_TOKEN}" \
+            -H "organization_uid: ${CS_ORG_UID}" \
+            -H "Content-Type: application/json" \
+            -d '{"name":"'"${ENV_NAME}"'","frameworkPreset":"NextJs"}')
+
+          NEW_UID=$(echo "$RESPONSE" | jq -r '.uid // .data.uid // ""')
+
+          if [ -z "$NEW_UID" ]; then
+            echo "Error: could not create environment. API response:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          echo "Created environment: ${ENV_NAME} (${NEW_UID})"
+          echo "uid=${NEW_UID}"   >> "$GITHUB_OUTPUT"
+          echo "name=${ENV_NAME}" >> "$GITHUB_OUTPUT"
+
       - name: Deploy to Contentstack Launch
         id: preview
         env:
-          CS_AUTH_TOKEN:       ${{ secrets.CS_AUTH_TOKEN }}
-          CS_ORG_UID:          ${{ secrets.CS_ORG_UID }}
-          CS_PROJECT_UID:      ${{ secrets.CS_PROJECT_UID }}
-          CS_ENVIRONMENT_UID:  ${{ secrets.CS_ENVIRONMENT_UID }}
-          CS_REGION:           ${{ secrets.CS_REGION }}
+          CS_AUTH_TOKEN:      ${{ secrets.CS_AUTH_TOKEN }}
+          CS_ORG_UID:         ${{ secrets.CS_ORG_UID }}
+          CS_PROJECT_UID:     ${{ secrets.CS_PROJECT_UID }}
+          CS_ENVIRONMENT_UID: ${{ steps.env.outputs.uid }}
+          CS_REGION:          ${{ secrets.CS_REGION }}
         run: |
           set -euo pipefail
 
@@ -128,9 +184,7 @@ jobs:
             configHandler.set('authorisationType', 'BASIC');
           "
 
-          # csdx launch has no --project-uid flag. The project is identified via a
-          # .cs-launch.json file. The CLI reads currentConfig.uid from it and skips
-          # the interactive project-selection prompt (isExistingProject=true).
+          # Point the CLI at the per-release environment.
           # Note: --server-command is only supported for Analog/Angular/Nuxt/Remix/Astro,
           #       NOT NextJs — Launch handles Next.js runtime natively.
           cat > .cs-launch.json << JSON
@@ -145,13 +199,6 @@ jobs:
           }
           JSON
 
-          # --redeploy-latest avoids the interactive "redeploy?" prompt.
-          # It DOES overwrite the shared environment URL
-          # (e.g. prerelease-artifact-test.contentstackapps.com) — that's fine,
-          # because Contentstack Launch also assigns every individual deployment its
-          # own immutable URL (e.g. https://deploy-<uid>.contentstackapps.com).
-          # We capture that per-deployment URL below and post it to the PR comment,
-          # so each pre-release is independently accessible forever.
           DEPLOY_OUTPUT=$(csdx launch \
             --type           FileUpload \
             --org            "$CS_ORG_UID" \
@@ -165,22 +212,9 @@ jobs:
 
           echo "$DEPLOY_OUTPUT"
 
-          # The CLI prints two URL lines:
-          #   Environment URL  https://prerelease-artifact-test.contentstackapps.com  ← shared, changes each run
-          #   Deployment URL   https://deploy-<uid>.contentstackapps.com              ← unique, immutable per build
-          # We want the Deployment URL.
           PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" \
-            | grep -oiE '(deployment url)[[:space:]]+https://[^ ]+' \
-            | grep -oiE 'https://[^ ]+' \
+            | grep -oE 'https://[^ ]+' \
             | tail -1 || true)
-
-          # Fallback: if the label differs, grab the second distinct https:// URL
-          if [ -z "$PREVIEW_URL" ]; then
-            PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" \
-              | grep -oE 'https://[^ ]+' \
-              | grep -v "contentstackapps.com$" \
-              | tail -1 || true)
-          fi
 
           echo "url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
 
@@ -190,8 +224,9 @@ jobs:
         uses: actions/github-script@v7
         env:
           RELEASE_URL: ${{ steps.release.outputs.url }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG:         ${{ steps.tag.outputs.tag }}
           PREVIEW_URL: ${{ steps.preview.outputs.url }}
+          ENV_NAME:    ${{ steps.env.outputs.name }}
           MARKER: "<!-- prerelease-comment -->"
         with:
           script: |
@@ -199,17 +234,19 @@ jobs:
             const releaseUrl = process.env.RELEASE_URL;
             const tag        = process.env.TAG;
             const previewUrl = process.env.PREVIEW_URL;
+            const envName    = process.env.ENV_NAME;
 
-            // Each version gets its own immutable deployment URL — no query-param
-            // hacks needed. Removing --redeploy-latest in the deploy step is what
-            // makes Contentstack Launch create a fresh URL per run.
-            const newRow = previewUrl && previewUrl.trim().length > 0
-              ? `| \`${tag}\` | [GitHub Release](${releaseUrl}) | [Preview ↗](${previewUrl}) |`
-              : `| \`${tag}\` | [GitHub Release](${releaseUrl}) | _(deploy failed)_ |`;
+            const previewCell = previewUrl && previewUrl.trim().length > 0
+              ? `[${envName} ↗](${previewUrl})`
+              : `_(deploy failed)_`;
+
+            const newRow = `| \`${tag}\` | [GitHub Release](${releaseUrl}) | ${previewCell} |`;
 
             const header = [
               marker,
               `## ✅ Pre-releases for PR #${context.issue.number}`,
+              ``,
+              `> Each version is deployed to its own isolated environment — links never go stale.`,
               ``,
               `| Version | Release | Preview URL |`,
               `|---------|---------|-------------|`,
@@ -224,7 +261,7 @@ jobs:
 
             const existing = comments.find(c => c.body && c.body.includes(marker));
 
-            // Carry forward rows from the previous comment so no version is lost.
+            // Carry forward rows from the previous comment so no version is ever lost.
             let existingRows = "";
             if (existing) {
               existingRows = existing.body
@@ -233,8 +270,8 @@ jobs:
                 .join("\n");
             }
 
-            const allRows  = existingRows.length > 0 ? `${newRow}\n${existingRows}` : newRow;
-            const body     = `${header}\n${allRows}`;
+            const allRows = existingRows.length > 0 ? `${newRow}\n${existingRows}` : newRow;
+            const body    = `${header}\n${allRows}`;
 
             if (existing) {
               await github.rest.issues.updateComment({
