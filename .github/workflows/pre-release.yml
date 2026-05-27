@@ -100,11 +100,45 @@ jobs:
           files: |
             prerelease-artifact.tar.gz
 
-      # Replace this step with your real deploy command and emit the live URL.
-      - name: Set preview URL placeholder
+      # Deploy to Contentstack Launch via FileUpload.
+      # Replace nothing here — just fill in the 5 secrets in your repo settings.
+      - name: Deploy to Contentstack Launch
         id: preview
+        env:
+          CS_ORG_UID:          ${{ secrets.CS_ORG_UID }}
+          CS_MANAGEMENT_TOKEN: ${{ secrets.CS_MANAGEMENT_TOKEN }}
+          CS_PROJECT_UID:      ${{ secrets.CS_PROJECT_UID }}
+          CS_ENVIRONMENT_UID:  ${{ secrets.CS_ENVIRONMENT_UID }}
+          CS_REGION:           ${{ secrets.CS_REGION }}
         run: |
-          echo "url=" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          npm install -g @contentstack/cli@1.62.0 --silent
+
+          csdx config:set:region "$CS_REGION"
+          csdx auth:login --management-token "$CS_MANAGEMENT_TOKEN"
+
+          # FileUpload deploys the local build directly — no GitHub OAuth needed.
+          # The CLI prints the live URL in its output; we capture and parse it.
+          DEPLOY_OUTPUT=$(csdx launch \
+            --type        FileUpload \
+            --org         "$CS_ORG_UID" \
+            --project-uid "$CS_PROJECT_UID" \
+            --environment "$CS_ENVIRONMENT_UID" \
+            --data-dir    . \
+            --framework   NextJS \
+            --build-command "npm run build" \
+            --out-dir     ".next" \
+            --server-command "node_modules/.bin/next start" \
+            2>&1) || true
+
+          echo "$DEPLOY_OUTPUT"
+
+          PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" \
+            | grep -oE 'https://[a-zA-Z0-9./-]+\.contentstack\.dev[^ ]*' \
+            | tail -1 || true)
+
+          echo "url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Upsert PR comment with release details
         uses: actions/github-script@v7
