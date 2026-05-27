@@ -128,16 +128,31 @@ jobs:
             configHandler.set('authorisationType', 'BASIC');
           "
 
+          # csdx launch has no --project-uid flag. The project is identified via a
+          # .cs-launch.json file. The CLI reads currentConfig.uid from it and skips
+          # the interactive project-selection prompt (isExistingProject=true).
+          # Note: --server-command is only supported for Analog/Angular/Nuxt/Remix/Astro,
+          #       NOT NextJs — Launch handles Next.js runtime natively.
+          cat > .cs-launch.json << JSON
+          {
+            "deploy": {
+              "uid": "${CS_PROJECT_UID}",
+              "organizationUid": "${CS_ORG_UID}",
+              "projectType": "FILEUPLOAD",
+              "environment": "${CS_ENVIRONMENT_UID}"
+            }
+          }
+          JSON
+
           DEPLOY_OUTPUT=$(csdx launch \
+            -c .cs-launch.json \
             --type        FileUpload \
             --org         "$CS_ORG_UID" \
-            --project-uid "$CS_PROJECT_UID" \
             --environment "$CS_ENVIRONMENT_UID" \
             --data-dir    . \
             --framework   NextJs \
             --build-command "npm run build" \
             --out-dir     ".next" \
-            --server-command "node_modules/.bin/next start" \
             2>&1) || true
 
           echo "$DEPLOY_OUTPUT"
@@ -188,5 +203,7 @@ jobs:
                 owner, repo, issue_number, body
               });
             }
+
+
 
 
