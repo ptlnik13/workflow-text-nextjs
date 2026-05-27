@@ -159,7 +159,8 @@ jobs:
           echo "$DEPLOY_OUTPUT"
 
           PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" \
-            | grep -oE 'https://[a-zA-Z0-9./-]+\.contentstack\.dev[^ ]*' \
+            | grep -oE 'Deployment URL https://[^ ]+' \
+            | grep -oE 'https://[^ ]+' \
             | tail -1 || true)
 
           echo "url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
@@ -204,4 +205,6 @@ jobs:
                 owner, repo, issue_number, body
               });
             }
+
+
 
