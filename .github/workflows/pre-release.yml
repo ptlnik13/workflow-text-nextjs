@@ -101,12 +101,13 @@ jobs:
             prerelease-artifact.tar.gz
 
       # Deploy to Contentstack Launch via FileUpload.
-      # Replace nothing here — just fill in the 5 secrets in your repo settings.
+      # Requires secret CS_AUTH_TOKEN (your user authtoken — run this locally to get it:
+      #   node -e "const {configHandler}=require('$(npm root -g)/@contentstack/cli/node_modules/@contentstack/cli-utilities'); console.log(configHandler.get('authtoken'))")
       - name: Deploy to Contentstack Launch
         id: preview
         env:
+          CS_AUTH_TOKEN:       ${{ secrets.CS_AUTH_TOKEN }}
           CS_ORG_UID:          ${{ secrets.CS_ORG_UID }}
-          CS_MANAGEMENT_TOKEN: ${{ secrets.CS_MANAGEMENT_TOKEN }}
           CS_PROJECT_UID:      ${{ secrets.CS_PROJECT_UID }}
           CS_ENVIRONMENT_UID:  ${{ secrets.CS_ENVIRONMENT_UID }}
           CS_REGION:           ${{ secrets.CS_REGION }}
@@ -116,10 +117,17 @@ jobs:
           npm install -g @contentstack/cli@1.62.0 --silent
 
           csdx config:set:region "$CS_REGION"
-          csdx auth:login --management-token "$CS_MANAGEMENT_TOKEN"
 
-          # FileUpload deploys the local build directly — no GitHub OAuth needed.
-          # The CLI prints the live URL in its output; we capture and parse it.
+          # csdx encrypts its config via the `conf` npm package — a plain JSON write
+          # is ignored. Instead we use the same configHandler the CLI itself uses to
+          # write the authtoken into the encrypted store.
+          CSDX_ROOT=$(npm root -g)/@contentstack/cli
+          node -e "
+            const {configHandler} = require('${CSDX_ROOT}/node_modules/@contentstack/cli-utilities');
+            configHandler.set('authtoken', process.env.CS_AUTH_TOKEN);
+            configHandler.set('authorisationType', 'BASIC');
+          "
+
           DEPLOY_OUTPUT=$(csdx launch \
             --type        FileUpload \
             --org         "$CS_ORG_UID" \
@@ -180,4 +188,8 @@ jobs:
                 owner, repo, issue_number, body
               });
             }
+
+
+
+
 
