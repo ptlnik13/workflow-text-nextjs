@@ -211,27 +211,12 @@ jobs:
 
           echo "$DEPLOY_OUTPUT"
 
-          # ── Diagnostics: show every URL the CLI printed ──────────────────────
-          echo "--- All URLs found in deploy output ---"
-          echo "$DEPLOY_OUTPUT" | grep -oE 'https://[^ ]+' || echo "(none found)"
-          echo "---------------------------------------"
-
-          # Try to find a deployment-specific URL — it differs from the fixed
-          # environment URL (which ends with the plain project slug).
-          # Contentstack Launch may print both; we want the unique one.
-          ALL_URLS=$(echo "$DEPLOY_OUTPUT" | grep -oE 'https://[^ ]+')
-
-          # Prefer the URL that contains a hash/id segment (deployment preview URL).
-          PREVIEW_URL=$(echo "$ALL_URLS" \
-            | grep -E 'https://[a-zA-Z0-9]+-[a-zA-Z0-9]{6,}' \
+          # Contentstack Launch outputs exactly one URL — the environment URL.
+          # Per-release URL isolation is achieved via CS_PREVIEW_SLOTS (separate projects).
+          PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" \
+            | grep -oE 'https://[^ ]*contentstackapps\.com[^ ]*' \
             | head -1 || true)
 
-          # Fall back to the first URL in the output if no unique deployment URL found.
-          if [ -z "$PREVIEW_URL" ]; then
-            PREVIEW_URL=$(echo "$ALL_URLS" | head -1 || true)
-          fi
-
-          echo "Selected preview URL: ${PREVIEW_URL}"
           echo "url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
 
       # Upserts a single PR comment that accumulates all pre-release rows in a
