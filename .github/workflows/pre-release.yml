@@ -99,67 +99,72 @@ jobs:
           files: |
             prerelease-artifact.tar.gz
 
-      # Each pre-release tag gets its own isolated Contentstack Launch environment.
+      # Each pre-release tag is deployed to its own Contentstack Launch PROJECT so
+      # it gets a permanently unique URL. URLs are project-scoped in Launch —
+      # environments within one project all share the same subdomain.
       #
-      # Because the Launch API does not expose an endpoint for creating environments
-      # programmatically, environments must be pre-created in the Launch dashboard.
-      # Store their UIDs as a comma-separated secret, e.g.:
+      # Pre-create N projects in the Launch dashboard, then store their
+      # project+environment UID pairs as a colon-joined, comma-separated secret:
       #
-      #   CS_PREVIEW_ENVIRONMENT_UIDS = uid1,uid2,uid3,uid4,uid5
+      #   CS_PREVIEW_SLOTS = projUid1:envUid1,projUid2:envUid2,projUid3:envUid3
       #
-      # The workflow picks a slot using:  counter mod len(uids)
-      # So release-0.1 → slot 0, release-0.2 → slot 1, …, release-0.6 → slot 0 again.
-      # In practice a slot is only reused after (uids.length) releases, by which time
-      # the earlier release is irrelevant.
+      # Slot selection: counter mod len(slots)
+      #   release-0.1 → slot 0, release-0.2 → slot 1, …, release-0.4 → slot 0 again (for 3 slots)
+      # A slot is only reused after N releases — by then the earlier release is obsolete.
+      #
+      # Falls back to CS_PROJECT_UID + CS_ENVIRONMENT_UID when CS_PREVIEW_SLOTS is not set.
       #
       # Required secrets:
-      #   CS_AUTH_TOKEN                — user authtoken (BASIC auth)
-      #   CS_ORG_UID                   — organisation UID
-      #   CS_PROJECT_UID               — Launch project UID
-      #   CS_REGION                    — e.g. NA, EU, AZURE_NA
-      #   CS_PREVIEW_ENVIRONMENT_UIDS  — comma-separated list of pre-created env UIDs
-      - name: Select preview environment slot
+      #   CS_AUTH_TOKEN      — user authtoken (BASIC auth)
+      #   CS_ORG_UID         — organisation UID
+      #   CS_PROJECT_UID     — fallback Launch project UID
+      #   CS_ENVIRONMENT_UID — fallback Launch environment UID
+      #   CS_REGION          — e.g. NA, EU, AZURE_NA
+      #   CS_PREVIEW_SLOTS   — (optional) projUid1:envUid1,projUid2:envUid2,…
+      - name: Select preview project slot
         id: env
         env:
-          CS_PREVIEW_ENVIRONMENT_UIDS: ${{ secrets.CS_PREVIEW_ENVIRONMENT_UIDS }}
-          CS_ENVIRONMENT_UID:          ${{ secrets.CS_ENVIRONMENT_UID }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          CS_PREVIEW_SLOTS:   ${{ secrets.CS_PREVIEW_SLOTS }}
+          CS_PROJECT_UID:     ${{ secrets.CS_PROJECT_UID }}
+          CS_ENVIRONMENT_UID: ${{ secrets.CS_ENVIRONMENT_UID }}
+          TAG:                ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
 
-          # If CS_PREVIEW_ENVIRONMENT_UIDS is not configured, fall back to the
-          # single default environment. All releases will share that URL until
-          # the pool secret is populated.
-          if [ -z "${CS_PREVIEW_ENVIRONMENT_UIDS:-}" ]; then
-            echo "CS_PREVIEW_ENVIRONMENT_UIDS not set — falling back to CS_ENVIRONMENT_UID."
-            echo "uid=${CS_ENVIRONMENT_UID}" >> "$GITHUB_OUTPUT"
-            echo "slot=default"              >> "$GITHUB_OUTPUT"
+          if [ -z "${CS_PREVIEW_SLOTS:-}" ]; then
+            echo "CS_PREVIEW_SLOTS not set — falling back to default project/environment."
+            echo "project_uid=${CS_PROJECT_UID}"     >> "$GITHUB_OUTPUT"
+            echo "environment_uid=${CS_ENVIRONMENT_UID}" >> "$GITHUB_OUTPUT"
+            echo "slot=default"                      >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # Extract the release counter from the tag (the trailing number after the last dot)
           COUNTER=$(echo "${TAG}" | grep -oE '[0-9]+$')
 
-          # Split the comma-separated UID list into an array and pick by rotation
-          IFS=',' read -ra UIDS <<< "${CS_PREVIEW_ENVIRONMENT_UIDS}"
-          COUNT=${#UIDS[@]}
-
+          IFS=',' read -ra SLOTS <<< "${CS_PREVIEW_SLOTS}"
+          COUNT=${#SLOTS[@]}
           SLOT=$(( COUNTER % COUNT ))
-          SELECTED_UID="${UIDS[$SLOT]}"
-          # Trim any accidental whitespace
-          SELECTED_UID="${SELECTED_UID// /}"
+          SELECTED="${SLOTS[$SLOT]}"
+          SELECTED="${SELECTED// /}"   # trim whitespace
 
-          echo "Release counter: ${COUNTER} | Slots available: ${COUNT} | Slot chosen: ${SLOT}"
-          echo "uid=${SELECTED_UID}" >> "$GITHUB_OUTPUT"
-          echo "slot=${SLOT}"        >> "$GITHUB_OUTPUT"
+          PROJECT_UID="${SELECTED%%:*}"
+          ENV_UID="${SELECTED##*:}"
+
+          echo "Counter: ${COUNTER} | Slots: ${COUNT} | Slot chosen: ${SLOT}"
+          echo "Project: ${PROJECT_UID} | Environment: ${ENV_UID}"
+
+          echo "project_uid=${PROJECT_UID}"       >> "$GITHUB_OUTPUT"
+          echo "environment_uid=${ENV_UID}"       >> "$GITHUB_OUTPUT"
+          echo "slot=${SLOT}"                     >> "$GITHUB_OUTPUT"
 
       - name: Deploy to Contentstack Launch
         id: preview
         env:
           CS_AUTH_TOKEN:      ${{ secrets.CS_AUTH_TOKEN }}
           CS_ORG_UID:         ${{ secrets.CS_ORG_UID }}
-          CS_PROJECT_UID:     ${{ secrets.CS_PROJECT_UID }}
-          CS_ENVIRONMENT_UID: ${{ steps.env.outputs.uid }}
+          CS_PROJECT_UID:     ${{ steps.env.outputs.project_uid }}
+          CS_ENVIRONMENT_UID: ${{ steps.env.outputs.environment_uid }}
           CS_REGION:          ${{ secrets.CS_REGION }}
         run: |
           set -euo pipefail
@@ -206,10 +211,27 @@ jobs:
 
           echo "$DEPLOY_OUTPUT"
 
-          PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" \
-            | grep -oE 'https://[^ ]+' \
-            | tail -1 || true)
+          # ── Diagnostics: show every URL the CLI printed ──────────────────────
+          echo "--- All URLs found in deploy output ---"
+          echo "$DEPLOY_OUTPUT" | grep -oE 'https://[^ ]+' || echo "(none found)"
+          echo "---------------------------------------"
 
+          # Try to find a deployment-specific URL — it differs from the fixed
+          # environment URL (which ends with the plain project slug).
+          # Contentstack Launch may print both; we want the unique one.
+          ALL_URLS=$(echo "$DEPLOY_OUTPUT" | grep -oE 'https://[^ ]+')
+
+          # Prefer the URL that contains a hash/id segment (deployment preview URL).
+          PREVIEW_URL=$(echo "$ALL_URLS" \
+            | grep -E 'https://[a-zA-Z0-9]+-[a-zA-Z0-9]{6,}' \
+            | head -1 || true)
+
+          # Fall back to the first URL in the output if no unique deployment URL found.
+          if [ -z "$PREVIEW_URL" ]; then
+            PREVIEW_URL=$(echo "$ALL_URLS" | head -1 || true)
+          fi
+
+          echo "Selected preview URL: ${PREVIEW_URL}"
           echo "url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
 
       # Upserts a single PR comment that accumulates all pre-release rows in a
