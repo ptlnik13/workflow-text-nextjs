@@ -1,0 +1,286 @@
+name: Pre-release on PR label (hardened)
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Only one release job runs per PR at a time.
+# If someone manages to double-click the label, the first run wins.
+concurrency:
+  group: prerelease-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  prerelease:
+    runs-on: ubuntu-latest
+    if: github.event.label.name == 'pre-release'
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Source of truth: always the PR-branch package.json, never the base branch.
+      - name: Read base version from package.json
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "base_version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Every label-add = a brand-new release with the next counter.
+      # Format: v{branch-version}-pre-release-0.{N}
+      # e.g.  v5.2.0-pre-release-0.1  →  v5.2.0-pre-release-0.2  →  …
+      # Counter is scoped to the version so a version bump resets numbering naturally.
+      - name: Resolve next release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_VERSION: ${{ steps.version.outputs.base_version }}
+        run: |
+          set -euo pipefail
+
+          PREFIX="v${BASE_VERSION}-pre-release-0."
+
+          # Fetch all tags (paginated — no cap).
+          # API call is kept separate from grep so only "no matches" is suppressed,
+          # not a real API/network failure.
+          ALL_TAGS=$(gh api "repos/${REPO}/tags" --paginate --jq '.[].name')
+
+          MAX=$(echo "${ALL_TAGS}" \
+            | grep -E "^${PREFIX}[0-9]+$" \
+            | sed -E "s/^${PREFIX}//" \
+            | sort -n | tail -1 || true)
+
+          NEXT=$(( ${MAX:-0} + 1 ))
+          TAG="${PREFIX}${NEXT}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build --if-present
+
+      - name: Package artifact
+        run: |
+          tar -czf /tmp/prerelease-artifact.tar.gz \
+            --exclude=./.git \
+            --exclude=./node_modules \
+            .
+          mv /tmp/prerelease-artifact.tar.gz prerelease-artifact.tar.gz
+
+      # Every run creates a fresh release — never updates an existing one.
+      - name: Create pre-release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.event.pull_request.head.sha }}
+          name: ${{ steps.tag.outputs.tag }}
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          body: |
+            Automated pre-release for PR #${{ github.event.pull_request.number }}
+            Source branch: `${{ github.event.pull_request.head.ref }}`
+            Commit: `${{ github.event.pull_request.head.sha }}`
+          files: |
+            prerelease-artifact.tar.gz
+
+      # Each pre-release tag is deployed to its own Contentstack Launch PROJECT so
+      # it gets a permanently unique URL. URLs are project-scoped in Launch —
+      # environments within one project all share the same subdomain.
+      #
+      # Pre-create N projects in the Launch dashboard, then store their
+      # project+environment UID pairs as a colon-joined, comma-separated secret:
+      #
+      #   CS_PREVIEW_SLOTS = projUid1:envUid1,projUid2:envUid2,projUid3:envUid3
+      #
+      # Slot selection: counter mod len(slots)
+      #   release-0.1 → slot 0, release-0.2 → slot 1, …, release-0.4 → slot 0 again (for 3 slots)
+      # A slot is only reused after N releases — by then the earlier release is obsolete.
+      #
+      # Falls back to CS_PROJECT_UID + CS_ENVIRONMENT_UID when CS_PREVIEW_SLOTS is not set.
+      #
+      # Required secrets:
+      #   CS_AUTH_TOKEN      — user authtoken (BASIC auth)
+      #   CS_ORG_UID         — organisation UID
+      #   CS_PROJECT_UID     — fallback Launch project UID
+      #   CS_ENVIRONMENT_UID — fallback Launch environment UID
+      #   CS_REGION          — e.g. NA, EU, AZURE_NA
+      #   CS_PREVIEW_SLOTS   — (optional) projUid1:envUid1,projUid2:envUid2,…
+      - name: Select preview project slot
+        id: env
+        env:
+          CS_PREVIEW_SLOTS:   ${{ secrets.CS_PREVIEW_SLOTS }}
+          CS_PROJECT_UID:     ${{ secrets.CS_PROJECT_UID }}
+          CS_ENVIRONMENT_UID: ${{ secrets.CS_ENVIRONMENT_UID }}
+          TAG:                ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CS_PREVIEW_SLOTS:-}" ]; then
+            echo "CS_PREVIEW_SLOTS not set — falling back to default project/environment."
+            echo "project_uid=${CS_PROJECT_UID}"     >> "$GITHUB_OUTPUT"
+            echo "environment_uid=${CS_ENVIRONMENT_UID}" >> "$GITHUB_OUTPUT"
+            echo "slot=default"                      >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Extract the release counter from the tag (the trailing number after the last dot)
+          COUNTER=$(echo "${TAG}" | grep -oE '[0-9]+$')
+
+          IFS=',' read -ra SLOTS <<< "${CS_PREVIEW_SLOTS}"
+          COUNT=${#SLOTS[@]}
+          SLOT=$(( COUNTER % COUNT ))
+          SELECTED="${SLOTS[$SLOT]}"
+          SELECTED="${SELECTED// /}"   # trim whitespace
+
+          PROJECT_UID="${SELECTED%%:*}"
+          ENV_UID="${SELECTED##*:}"
+
+          echo "Counter: ${COUNTER} | Slots: ${COUNT} | Slot chosen: ${SLOT}"
+          echo "Project: ${PROJECT_UID} | Environment: ${ENV_UID}"
+
+          echo "project_uid=${PROJECT_UID}"       >> "$GITHUB_OUTPUT"
+          echo "environment_uid=${ENV_UID}"       >> "$GITHUB_OUTPUT"
+          echo "slot=${SLOT}"                     >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to Contentstack Launch
+        id: preview
+        env:
+          CS_AUTH_TOKEN:      ${{ secrets.CS_AUTH_TOKEN }}
+          CS_ORG_UID:         ${{ secrets.CS_ORG_UID }}
+          CS_PROJECT_UID:     ${{ steps.env.outputs.project_uid }}
+          CS_ENVIRONMENT_UID: ${{ steps.env.outputs.environment_uid }}
+          CS_REGION:          ${{ secrets.CS_REGION }}
+        run: |
+          set -euo pipefail
+
+          npm install -g @contentstack/cli@1.62.0 --silent
+
+          csdx config:set:region "$CS_REGION"
+
+          # csdx encrypts its config via the `conf` npm package — a plain JSON write
+          # is ignored. Instead we use the same configHandler the CLI itself uses to
+          # write the authtoken into the encrypted store.
+          CSDX_ROOT=$(npm root -g)/@contentstack/cli
+          node -e "
+            const {configHandler} = require('${CSDX_ROOT}/node_modules/@contentstack/cli-utilities');
+            configHandler.set('authtoken', process.env.CS_AUTH_TOKEN);
+            configHandler.set('authorisationType', 'BASIC');
+          "
+
+          # Point the CLI at the per-release environment.
+          # Note: --server-command is only supported for Analog/Angular/Nuxt/Remix/Astro,
+          #       NOT NextJs — Launch handles Next.js runtime natively.
+          cat > .cs-launch.json << JSON
+          {
+            "deploy": {
+              "uid": "${CS_PROJECT_UID}",
+              "organizationUid": "${CS_ORG_UID}",
+              "projectType": "FILEUPLOAD",
+              "environment": "${CS_ENVIRONMENT_UID}",
+              "deployments": []
+            }
+          }
+          JSON
+
+          DEPLOY_OUTPUT=$(csdx launch \
+            --type           FileUpload \
+            --org            "$CS_ORG_UID" \
+            --environment    "$CS_ENVIRONMENT_UID" \
+            --data-dir       . \
+            --framework      NextJs \
+            --build-command  "npm run build" \
+            --out-dir        ".next" \
+            --redeploy-latest \
+            2>&1) || true
+
+          echo "$DEPLOY_OUTPUT"
+
+          # Contentstack Launch outputs exactly one URL — the environment URL.
+          # Per-release URL isolation is achieved via CS_PREVIEW_SLOTS (separate projects).
+          PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" \
+            | grep -oE 'https://[^ ]*contentstackapps\.com[^ ]*' \
+            | head -1 || true)
+
+          echo "url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
+
+      # Upserts a single PR comment that accumulates all pre-release rows in a
+      # table — newest version at the top, every past version still clickable.
+      - name: Upsert PR comment with release history
+        uses: actions/github-script@v7
+        env:
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+          TAG:         ${{ steps.tag.outputs.tag }}
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+          ENV_SLOT:    ${{ steps.env.outputs.slot }}
+          MARKER: "<!-- prerelease-comment -->"
+        with:
+          script: |
+            const marker     = process.env.MARKER;
+            const releaseUrl = process.env.RELEASE_URL;
+            const tag        = process.env.TAG;
+            const previewUrl = process.env.PREVIEW_URL;
+            const envSlot    = process.env.ENV_SLOT;
+
+            const previewCell = previewUrl && previewUrl.trim().length > 0
+              ? `[slot-${envSlot} ↗](${previewUrl})`
+              : `_(deploy failed)_`;
+
+            const newRow = `| \`${tag}\` | [GitHub Release](${releaseUrl}) | ${previewCell} |`;
+
+            const header = [
+              marker,
+              `## ✅ Pre-releases for PR #${context.issue.number}`,
+              ``,
+              `> Each version is deployed to its own isolated environment — links never go stale.`,
+              ``,
+              `| Version | Release | Preview URL |`,
+              `|---------|---------|-------------|`,
+            ].join("\n");
+
+            const { owner, repo } = context.repo;
+            const issue_number    = context.issue.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            // Carry forward rows from the previous comment so no version is ever lost.
+            let existingRows = "";
+            if (existing) {
+              existingRows = existing.body
+                .split("\n")
+                .filter(l => l.startsWith("|") && !l.includes("Version") && !l.includes("---"))
+                .join("\n");
+            }
+
+            const allRows = existingRows.length > 0 ? `${newRow}\n${existingRows}` : newRow;
+            const body    = `${header}\n${allRows}`;
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body
+              });
+            }
+
