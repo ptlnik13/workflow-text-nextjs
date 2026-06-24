@@ -1,0 +1,248 @@
+name: Pre-release on PR label (hardened)
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Only one release job runs per PR at a time.
+# If someone manages to double-click the label, the first run wins.
+concurrency:
+  group: prerelease-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  prerelease:
+    runs-on: ubuntu-latest
+    if: github.event.label.name == 'pre-release'
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Source of truth: always the PR-branch package.json, never the base branch.
+      - name: Read base version from package.json
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "base_version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Every label-add = a brand-new release with the next counter.
+      # Format: v{branch-version}-pre-release-0.{N}
+      # e.g.  v5.2.0-pre-release-0.1  →  v5.2.0-pre-release-0.2  →  …
+      # Counter is scoped to the version so a version bump resets numbering naturally.
+      - name: Resolve next release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_VERSION: ${{ steps.version.outputs.base_version }}
+        run: |
+          set -euo pipefail
+
+          PREFIX="v${BASE_VERSION}-pre-release-0."
+
+          # Fetch all tags (paginated — no cap).
+          # API call is kept separate from grep so only "no matches" is suppressed,
+          # not a real API/network failure.
+          ALL_TAGS=$(gh api "repos/${REPO}/tags" --paginate --jq '.[].name')
+
+          MAX=$(echo "${ALL_TAGS}" \
+            | grep -E "^${PREFIX}[0-9]+$" \
+            | sed -E "s/^${PREFIX}//" \
+            | sort -n | tail -1 || true)
+
+          NEXT=$(( ${MAX:-0} + 1 ))
+          TAG="${PREFIX}${NEXT}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build --if-present
+
+      - name: Package artifact
+        run: |
+          tar -czf /tmp/prerelease-artifact.tar.gz \
+            --exclude=./.git \
+            --exclude=./node_modules \
+            .
+          mv /tmp/prerelease-artifact.tar.gz prerelease-artifact.tar.gz
+
+      # Every run creates a fresh release — never updates an existing one.
+      - name: Create pre-release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.event.pull_request.head.sha }}
+          name: ${{ steps.tag.outputs.tag }}
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          body: |
+            Automated pre-release for PR #${{ github.event.pull_request.number }}
+            Source branch: `${{ github.event.pull_request.head.ref }}`
+            Commit: `${{ github.event.pull_request.head.sha }}`
+          files: |
+            prerelease-artifact.tar.gz
+
+      # Deploy to Contentstack Launch via FileUpload.
+      # Requires secret CS_AUTH_TOKEN (your user authtoken — run this locally to get it:
+      #   node -e "const {configHandler}=require('$(npm root -g)/@contentstack/cli/node_modules/@contentstack/cli-utilities'); console.log(configHandler.get('authtoken'))")
+      - name: Deploy to Contentstack Launch
+        id: preview
+        env:
+          CS_AUTH_TOKEN:       ${{ secrets.CS_AUTH_TOKEN }}
+          CS_ORG_UID:          ${{ secrets.CS_ORG_UID }}
+          CS_PROJECT_UID:      ${{ secrets.CS_PROJECT_UID }}
+          CS_ENVIRONMENT_UID:  ${{ secrets.CS_ENVIRONMENT_UID }}
+          CS_REGION:           ${{ secrets.CS_REGION }}
+        run: |
+          set -euo pipefail
+
+          npm install -g @contentstack/cli@1.62.0 --silent
+
+          csdx config:set:region "$CS_REGION"
+
+          # csdx encrypts its config via the `conf` npm package — a plain JSON write
+          # is ignored. Instead we use the same configHandler the CLI itself uses to
+          # write the authtoken into the encrypted store.
+          CSDX_ROOT=$(npm root -g)/@contentstack/cli
+          node -e "
+            const {configHandler} = require('${CSDX_ROOT}/node_modules/@contentstack/cli-utilities');
+            configHandler.set('authtoken', process.env.CS_AUTH_TOKEN);
+            configHandler.set('authorisationType', 'BASIC');
+          "
+
+          # csdx launch has no --project-uid flag. The project is identified via a
+          # .cs-launch.json file. The CLI reads currentConfig.uid from it and skips
+          # the interactive project-selection prompt (isExistingProject=true).
+          # Note: --server-command is only supported for Analog/Angular/Nuxt/Remix/Astro,
+          #       NOT NextJs — Launch handles Next.js runtime natively.
+          cat > .cs-launch.json << JSON
+          {
+            "deploy": {
+              "uid": "${CS_PROJECT_UID}",
+              "organizationUid": "${CS_ORG_UID}",
+              "projectType": "FILEUPLOAD",
+              "environment": "${CS_ENVIRONMENT_UID}",
+              "deployments": []
+            }
+          }
+          JSON
+
+          # --redeploy-latest avoids the interactive "redeploy?" prompt.
+          # It DOES overwrite the shared environment URL
+          # (e.g. prerelease-artifact-test.contentstackapps.com) — that's fine,
+          # because Contentstack Launch also assigns every individual deployment its
+          # own immutable URL (e.g. https://deploy-<uid>.contentstackapps.com).
+          # We capture that per-deployment URL below and post it to the PR comment,
+          # so each pre-release is independently accessible forever.
+          DEPLOY_OUTPUT=$(csdx launch \
+            --type           FileUpload \
+            --org            "$CS_ORG_UID" \
+            --environment    "$CS_ENVIRONMENT_UID" \
+            --data-dir       . \
+            --framework      NextJs \
+            --build-command  "npm run build" \
+            --out-dir        ".next" \
+            --redeploy-latest \
+            2>&1) || true
+
+          echo "$DEPLOY_OUTPUT"
+
+          # The CLI prints two URL lines:
+          #   Environment URL  https://prerelease-artifact-test.contentstackapps.com  ← shared, changes each run
+          #   Deployment URL   https://deploy-<uid>.contentstackapps.com              ← unique, immutable per build
+          # We want the Deployment URL.
+          PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" \
+            | grep -oiE '(deployment url)[[:space:]]+https://[^ ]+' \
+            | grep -oiE 'https://[^ ]+' \
+            | tail -1 || true)
+
+          # Fallback: if the label differs, grab the second distinct https:// URL
+          if [ -z "$PREVIEW_URL" ]; then
+            PREVIEW_URL=$(echo "$DEPLOY_OUTPUT" \
+              | grep -oE 'https://[^ ]+' \
+              | grep -v "contentstackapps.com$" \
+              | tail -1 || true)
+          fi
+
+          echo "url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
+
+      # Upserts a single PR comment that accumulates all pre-release rows in a
+      # table — newest version at the top, every past version still clickable.
+      - name: Upsert PR comment with release history
+        uses: actions/github-script@v7
+        env:
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+          MARKER: "<!-- prerelease-comment -->"
+        with:
+          script: |
+            const marker     = process.env.MARKER;
+            const releaseUrl = process.env.RELEASE_URL;
+            const tag        = process.env.TAG;
+            const previewUrl = process.env.PREVIEW_URL;
+
+            // Each version gets its own immutable deployment URL — no query-param
+            // hacks needed. Removing --redeploy-latest in the deploy step is what
+            // makes Contentstack Launch create a fresh URL per run.
+            const newRow = previewUrl && previewUrl.trim().length > 0
+              ? `| \`${tag}\` | [GitHub Release](${releaseUrl}) | [Preview ↗](${previewUrl}) |`
+              : `| \`${tag}\` | [GitHub Release](${releaseUrl}) | _(deploy failed)_ |`;
+
+            const header = [
+              marker,
+              `## ✅ Pre-releases for PR #${context.issue.number}`,
+              ``,
+              `| Version | Release | Preview URL |`,
+              `|---------|---------|-------------|`,
+            ].join("\n");
+
+            const { owner, repo } = context.repo;
+            const issue_number    = context.issue.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            // Carry forward rows from the previous comment so no version is lost.
+            let existingRows = "";
+            if (existing) {
+              existingRows = existing.body
+                .split("\n")
+                .filter(l => l.startsWith("|") && !l.includes("Version") && !l.includes("---"))
+                .join("\n");
+            }
+
+            const allRows  = existingRows.length > 0 ? `${newRow}\n${existingRows}` : newRow;
+            const body     = `${header}\n${allRows}`;
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body
+              });
+            }
+
